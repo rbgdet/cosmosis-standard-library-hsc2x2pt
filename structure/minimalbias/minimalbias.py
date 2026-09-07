@@ -123,7 +123,7 @@ class minimalbias_class:
         xi2d = ius(r, xi, ext=3)(s)
 
         
-        wp = 2*integrate.simps(xi2d, rpi, axis=0)
+        wp = 2*integrate.simpson(xi2d, x=rpi, axis=0)
         
         if dlnrp>0.0:
             wp = binave_array(r, wp, dlnrp)
@@ -205,9 +205,9 @@ def binave_array(x, y, dlnx, D=2, nbin=100):
     arg = x2d*np.exp(X2d)
     y2d = ius(x, y)(arg)
     
-    nom = integrate.simps(arg**D, X, axis=0)
+    nom = integrate.simpson(arg**D, x=X, axis=0)
     
-    ybar = integrate.simps(y2d*arg**D, X, axis=0)/nom
+    ybar = integrate.simpson(y2d*arg**D, x=X, axis=0)/nom
     
     return ybar
         
@@ -240,7 +240,7 @@ def _get_wp_aniso(r, xi0, xi2, xi4, beta, rp_in, pimax):
 
     xi_aniso = 2*(xi0s*p0+xi2s*p2+xi4s*p4)
 
-    wp_aniso = integrate.simps(xi_aniso, rpi, axis=0)
+    wp_aniso = integrate.simpson(xi_aniso, x=rpi, axis=0)
 
     if interpolate:
         wp_aniso = ius(rp, wp_aniso)(rp_in)

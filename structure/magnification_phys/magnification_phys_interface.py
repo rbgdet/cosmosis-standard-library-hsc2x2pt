@@ -179,10 +179,12 @@ def execute(block, config):
             # print(block[section_names['nz_source'], "z"], block[section_names['nz_source'], "bin_{0}".format(j+1)])
             mag.set_nz_source(block[section_names['nz_source'], "z"], block[section_names['nz_source'], "bin_{0}".format(j+1)])
             f_ds = block.get_double(section_names['f_ds'], 'bin_{0}_{1}'.format(i+1,j+1), 1.0)
-            block[section_names['ds_out']+'_gG', 'bin_{0}_{1}'.format(i+1,j+1)]  = block[section_names['ds_out'], 'bin_{0}_{1}'.format(i+1,j+1)]
-            block[section_names['ds_out']      , 'bin_{0}_{1}'.format(i+1,j+1)] += f_ds * mag.get_ds_mag(zl, f_rp*rp_ds, dlnrp_ds)
+            bin_name = 'bin_{0}_{1}'.format(i+1,j+1)
+            ds_mag = mag.get_ds_mag(zl, f_rp*rp_ds, dlnrp_ds)
+            block[section_names['ds_out']+'_gG', bin_name]  = block[section_names['ds_out'], bin_name]
+            block[section_names['ds_out']      , bin_name] += f_ds * ds_mag
             
             if save_mag:
-                block['ds_mag', 'bin_{0}_{1}'.format(i+1,j+1)] = mag.get_ds_mag(zl, f_rp*rp_ds, dlnrp_ds)
+                block['ds_mag', bin_name] = ds_mag
     
     return 0

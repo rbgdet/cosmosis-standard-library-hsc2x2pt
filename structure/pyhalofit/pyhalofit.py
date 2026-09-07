@@ -127,7 +127,7 @@ def _sigma(k, Delta_L, R):
     Returns:
         sigma (float): variance of linear power smoothed at scale :math:`R`.
     """
-    return integrate.simps(Delta_L*np.exp(-(k*R)**2), np.log(k))
+    return integrate.simpson(Delta_L*np.exp(-(k*R)**2), np.log(k))
 
 def _get_R_sigma_max(k):
     return 0.01/k.max()

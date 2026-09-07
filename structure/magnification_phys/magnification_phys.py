@@ -7,6 +7,7 @@ This computes the magnification bias on g-g lensing in physical scale, i.e. dSig
 Code reviewed by Tianqing Zhang in Oct 2023
 """
 import numpy as np
+from numba import njit
 from scipy import integrate
 from scipy.interpolate import InterpolatedUnivariateSpline as ius
 from fftlog import hankel, fftlog
@@ -77,7 +78,7 @@ class magnification_class:
         
         chi= self.z2chi(self.pk_nlin_data[0][sel]) # [Mpc/h]
         integrand   = window(chi)*pltable
-        clSigmacrit = integrate.simps(integrand.T, chi, axis=0)
+        clSigmacrit = integrate.simpson(integrand.T, chi, axis=0)
         clSigmacrit*= prefactor/1e12 # hMsun/pc^2
         return l, clSigmacrit
     
@@ -113,92 +114,139 @@ class magnification_class:
         return ds_mag
 
 
-def get_Sigmacr_Cl_window(zs_in, nzs_in, zl_in, nzl_in, z2chi):
-    if isinstance(zl_in, (int, float)) and isinstance(nzl_in, (int, float)):
-        zl = np.array([zl_in])
-        nzl = np.array([1])
-        dzl = 1
-    else:
-        # discard nz with 0
-        sel = nzl_in > 0
-        zl = zl_in[sel]
-        nzl= nzl_in[sel]
-        dzl = np.diff(zl)[0]
-        assert np.all(np.isclose(np.diff(zl), dzl))
-    if isinstance(zs_in, (int, float)) and isinstance(nzs_in, (int, float)):
-        zs = np.array([zs])
-        nzs = np.array([1])
-        dzs = 1
-    else:
-        # discard nz with 0
-        sel = nzs_in > 0
-        zs = zs_in[sel]
-        nzs= nzs_in[sel]
-        dzs = np.diff(zs)[0]
-        # print(np.diff(zs))
-        # assert np.all(np.isclose(np.diff(zs), dzs, rtol=0.01)), "photoz bin must be linear within 1% "
-    
-    nzs_normed = nzs/(np.sum(nzs)*dzs)
-    nzl_normed = nzl/(np.sum(nzl)*dzl)
-    
-    chil = z2chi(zl) # Mpc/h
-    chis = z2chi(zs) # Mpc/h
-    # print(chil)
-    # print(chis)
-    
-    c0, c1, c2 = [], [], []
-    for _zs, _nzs, _chis in zip(zs, nzs_normed, chis):
-        _c0, _c1, _c2 = [], [], []
-        for _zl, _nzl, _chil in zip(zl, nzl_normed, chil):
-            if _zl >= _zs:
-                _c0.append(0.0)
-                _c1.append(0.0)
-                _c2.append(0.0)
-            else:
-                if 1+_zl==0.0:
-                    print("1+zl = ", 1+_zl)
-                if _chil==0.0:
-                    print("_chil= ", _chil)
-                if np.abs(_chis-_chil)<1e-3:
-                    # print("(_chis-_chil)= ", (_chis-_chil))
-                    _c0.append(0.0)
-                    _c1.append(0.0)
-                    _c2.append(0.0)
-                    continue
-                _c0.append(_nzs*_nzl/(1+_zl)/_chil**2/(_chis-_chil) * _chil*_chis )
-                _c1.append(_nzs*_nzl/(1+_zl)/_chil**2/(_chis-_chil) * (_chil+_chis) )
-                _c2.append(_nzs*_nzl/(1+_zl)/_chil**2/(_chis-_chil) )
-        c0.append(_c0)
-        c1.append(_c1)
-        c2.append(_c2)
-        
-    c0 = np.array(c0)
-    c1 = np.array(c1)
-    c2 = np.array(c2)
-    
-    # print(c0,c1,c2)
-    
-    zlMat, zsMat = np.meshgrid(zl, zs)
-    assert np.all(c0.shape == zlMat.shape)
-    assert np.all(c0.shape == zsMat.shape)
-    
-    z = np.linspace(0.0, zl[zl>0].max()*1.01, 100)
-    chi = z2chi(z) # Mpc/h
-    c0_chi, c1_chi, c2_chi = [], [], []
-    for _z, _chi in zip(z, chi):
-        mask = np.logical_and(zlMat>_z, zsMat>_z, zsMat>zlMat)
-        c0_chi.append( np.sum(c0[mask])*dzl*dzs )
-        c1_chi.append( np.sum(c1[mask])*dzl*dzs )
-        c2_chi.append( np.sum(c2[mask])*dzl*dzs )
-    c0_chi = np.array(c0_chi)
-    c1_chi = np.array(c1_chi)
-    c2_chi = np.array(c2_chi)
-    # print(c0_chi, c1_chi, c2_chi)
-    
-    window = (c0_chi - c1_chi*chi + c2_chi*chi**2)*(1+z)**2
+@njit(cache=True)
+def _compute_window_coefficients_numba(zs, nzs, zl, nzl, chis, chil):
+    """Integrate the three window coefficients over source redshift."""
+    nlens = zl.size
+    c0_by_lens = np.zeros(nlens)
+    c1_by_lens = np.zeros(nlens)
+    c2_by_lens = np.zeros(nlens)
 
-    window = ius(chi, window, ext=1) # [h/Mpc]
+    for ilens in range(nlens):
+        if chil[ilens] == 0.0 or 1.0 + zl[ilens] == 0.0:
+            continue
+
+        for isource in range(zs.size):
+            if zl[ilens] >= zs[isource]:
+                continue
+
+            delta_chi = chis[isource] - chil[ilens]
+            if np.abs(delta_chi) < 1.0e-3:
+                continue
+
+            common = (
+                nzs[isource]
+                * nzl[ilens]
+                / (1.0 + zl[ilens])
+                / chil[ilens]**2
+                / delta_chi
+            )
+            c0_by_lens[ilens] += common * chil[ilens] * chis[isource]
+            c1_by_lens[ilens] += common * (chil[ilens] + chis[isource])
+            c2_by_lens[ilens] += common
+
+    return c0_by_lens, c1_by_lens, c2_by_lens
+
+
+@njit(cache=True)
+def _evaluate_window_numba(
+    z,
+    chi,
+    zl,
+    c0_by_lens,
+    c1_by_lens,
+    c2_by_lens,
+    integration_weight,
+):
+    """Evaluate the magnification window on its integration grid."""
+    window = np.zeros(z.size)
+
+    for iz in range(z.size):
+        c0 = 0.0
+        c1 = 0.0
+        c2 = 0.0
+
+        for ilens in range(zl.size):
+            if zl[ilens] > z[iz]:
+                c0 += c0_by_lens[ilens]
+                c1 += c1_by_lens[ilens]
+                c2 += c2_by_lens[ilens]
+
+        window[iz] = (
+            c0 - c1 * chi[iz] + c2 * chi[iz]**2
+        ) * integration_weight * (1.0 + z[iz])**2
+
     return window
+
+
+def _prepare_redshift_distribution(z_in, nz_in, name, check_spacing):
+    """Filter and normalize an n(z) for the compiled window kernels."""
+    if np.isscalar(z_in) and np.isscalar(nz_in):
+        return (
+            np.ascontiguousarray([float(z_in)], dtype=np.float64),
+            np.ascontiguousarray([1.0], dtype=np.float64),
+            1.0,
+        )
+
+    z_in = np.asarray(z_in)
+    nz_in = np.asarray(nz_in)
+    if z_in.ndim != 1 or nz_in.ndim != 1 or z_in.size != nz_in.size:
+        raise ValueError(f"{name} z and n(z) must be one-dimensional arrays of equal length")
+
+    sel = nz_in > 0
+    z = np.ascontiguousarray(z_in[sel], dtype=np.float64)
+    nz = np.ascontiguousarray(nz_in[sel], dtype=np.float64)
+    if z.size < 2:
+        raise ValueError(f"{name} n(z) needs at least two positive samples")
+
+    dz = np.diff(z)[0]
+    if check_spacing and not np.all(np.isclose(np.diff(z), dz)):
+        raise ValueError(f"{name} redshift grid must be uniformly spaced")
+
+    normalization = np.sum(nz) * dz
+    if not np.isfinite(normalization) or normalization <= 0.0:
+        raise ValueError(f"{name} n(z) has invalid normalization")
+
+    return z, np.ascontiguousarray(nz / normalization), float(dz)
+
+
+def get_Sigmacr_Cl_window(zs_in, nzs_in, zl_in, nzl_in, z2chi):
+    """Construct the magnification window with compiled numerical kernels."""
+    zl, nzl, dzl = _prepare_redshift_distribution(
+        zl_in, nzl_in, "lens", check_spacing=True
+    )
+    zs, nzs, dzs = _prepare_redshift_distribution(
+        zs_in, nzs_in, "source", check_spacing=False
+    )
+
+    chil = np.ascontiguousarray(z2chi(zl), dtype=np.float64)
+    chis = np.ascontiguousarray(z2chi(zs), dtype=np.float64)
+    if not np.all(np.isfinite(chil)) or not np.all(np.isfinite(chis)):
+        raise ValueError("Comoving-distance arrays contain non-finite values")
+
+    c0_by_lens, c1_by_lens, c2_by_lens = (
+        _compute_window_coefficients_numba(zs, nzs, zl, nzl, chis, chil)
+    )
+
+    positive_lenses = zl > 0
+    if not np.any(positive_lenses):
+        raise ValueError("Lens n(z) has no positive-redshift samples")
+
+    z = np.linspace(0.0, zl[positive_lenses].max() * 1.01, 100)
+    chi = np.ascontiguousarray(z2chi(z), dtype=np.float64)
+    if not np.all(np.isfinite(chi)):
+        raise ValueError("Window comoving-distance grid contains non-finite values")
+
+    window = _evaluate_window_numba(
+        z,
+        chi,
+        zl,
+        c0_by_lens,
+        c1_by_lens,
+        c2_by_lens,
+        dzl * dzs,
+    )
+    return ius(chi, window, ext=1)  # [h/Mpc]
     
 def log_extrap_func(x,y):
     def func(x_new):

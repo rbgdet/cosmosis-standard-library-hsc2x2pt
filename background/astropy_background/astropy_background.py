@@ -90,14 +90,14 @@ def execute(block, config):
 
 	# comoving radial
 	D_C = model.comoving_distance(z).to_value(astropy.units.Mpc)
-	Ok0 = model._Ok0
+	Ok0 = model.Ok0
 
 	# comoving transverse
 	if Ok0 == 0:
 		D_M = D_C
 	else:
 		sqrtOk0 = np.sqrt(abs(Ok0))
-		dh = model._hubble_distance.value
+		dh = model.hubble_distance.value
 		if Ok0 > 0:
 			D_M = dh / sqrtOk0 * np.sinh(sqrtOk0 * D_C / dh)
 		else:
