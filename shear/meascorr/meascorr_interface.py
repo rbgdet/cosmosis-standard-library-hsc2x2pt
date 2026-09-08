@@ -9,6 +9,7 @@ Code reviewed by Tianqing Zhang in Oct 2023
 
 
 from cosmosis.datablock import names, option_section
+import numpy as np
 from astropy.io import fits
 from meascorr import dSigma_meascorr_class, wp_meascorr_class, rp_meascorr_class
 
@@ -40,27 +41,36 @@ class dSigma_meascorr_interface:
             for mc in self.dSigma_corrs:
                 mc.config['Omm'] = Omm
                 mc.config['w0'] = w0
+
+        # Each lens-source pair has its own measurement weights, but its
+        # fiducial-cosmology denominator is fixed for the entire run.
+        for mc in self.dSigma_corrs:
+            mc.prepare_reference()
         
     def load_fits(self, fname_fits):
-        hdus = fits.open(fname_fits)
-        
-        # get the photo-z bin
-        self.zs = hdus['PZBIN'].data['Z_MID']
-        
-        # get the matrix of sumwlssigcritinvPz and zl 
-        # and make dSigma_meascorr instance
-        self.dSigma_corrs = []
-        for ext in hdus:
-            if not ext.header.get('SUMPZ', False):
-                continue
-            mc = dSigma_meascorr_class.from_fits(ext)
-            mc.set_zs(self.zs)
-            self.dSigma_corrs.append(mc)
+        with fits.open(fname_fits) as hdus:
+            # Copy out of the FITS-backed arrays once during setup. This also
+            # gives the numerical kernel contiguous inputs without per-sample
+            # copies.
+            self.zs = np.array(hdus['PZBIN'].data['Z_MID'], dtype=np.float64)
+
+            # get the matrix of sumwlssigcritinvPz and zl
+            # and make dSigma_meascorr instance
+            self.dSigma_corrs = []
+            for ext in hdus:
+                if not ext.header.get('SUMPZ', False):
+                    continue
+                mc = dSigma_meascorr_class.from_fits(ext)
+                mc.set_zs(self.zs)
+                self.dSigma_corrs.append(mc)
         
     def execute(self, block):
         biases = self.bias_section
         Omm = block[names.cosmological_parameters, 'omega_m']
         w0  = block[names.cosmological_parameters, 'w']
+        cosmo = self.dSigma_corrs[0]._get_cosmo(Omm, w0)
+        source_distances = {}
+        lens_distances = {}
         for mc in self.dSigma_corrs:
             # Get bin0, bin1 for this correction module
             # where bin0 is the lens bin id, 
@@ -68,7 +78,24 @@ class dSigma_meascorr_interface:
             bin0, bin1 = mc.get_bin_pair()
             dz = block[biases, 'bias_{0}'.format(bin1+1)]
             z, nz = block['nz_source', 'z' ], block['nz_source', 'bin_%d'%(bin1+1)]
-            f = mc.get_corr_factor(dz, Omm, w0, bin1, z, nz)
+
+            source_key = (bin1, float(dz))
+            if source_key not in source_distances:
+                source_distances[source_key] = mc._get_source_distances(
+                    dz, cosmo)
+
+            # Lens samples are normally identical across source bins. Check
+            # before sharing so unusual input files retain the correct result.
+            if bin0 not in lens_distances:
+                chi_zl = mc._get_lens_distances(cosmo)
+                lens_distances[bin0] = (mc.zl, chi_zl)
+            cached_zl, chi_zl = lens_distances[bin0]
+            if cached_zl.shape != mc.zl.shape or not np.array_equal(cached_zl, mc.zl):
+                chi_zl = mc._get_lens_distances(cosmo)
+
+            f = mc.get_corr_factor(
+                dz, Omm, w0, bin1, z, nz, cosmo=cosmo,
+                chi_zl=chi_zl, chi_zs=source_distances[source_key])
             # print(bin0+1, bin1+1, f)
             block[self.section_name, 'bin_{0}_{1}'.format(bin0+1, bin1+1)] = f
     

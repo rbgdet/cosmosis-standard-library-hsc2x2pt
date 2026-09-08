@@ -263,4 +263,3 @@ def log_extrap_func(x,y):
         ans[sel] = 10**ius(np.log10(x),np.log10(y))(np.log10(x_new[sel]))
         return ans
     return func
-    

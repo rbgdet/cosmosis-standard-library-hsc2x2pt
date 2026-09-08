@@ -5,16 +5,119 @@ Last edit: 2023.05.17
 Code reviewed by Tianqing Zhang in Oct 2023
 """
 import numpy as np
+from numba import njit
 from scipy import integrate
-from scipy.interpolate import InterpolatedUnivariateSpline as ius
-from scipy.special import eval_legendre
+from scipy.interpolate import InterpolatedUnivariateSpline as ius, PPoly
 from fftlog import hankel, fftlog
+
+
+def _simpson_weights(x):
+    """Return weights equivalent to scipy.integrate.simpson(..., x=x)."""
+    n = x.size
+    weights = np.zeros(n, dtype=np.float64)
+    if n == 2:
+        weights[:] = 0.5 * (x[1] - x[0])
+        return weights
+
+    stop = n - 2 if n % 2 else n - 3
+    for i in range(0, stop, 2):
+        h0 = x[i + 1] - x[i]
+        h1 = x[i + 2] - x[i + 1]
+        hsum = h0 + h1
+        weights[i] += hsum / 6.0 * (2.0 - h1 / h0)
+        weights[i + 1] += hsum**3 / (6.0 * h0 * h1)
+        weights[i + 2] += hsum / 6.0 * (2.0 - h0 / h1)
+
+    if n % 2 == 0:
+        h0 = x[-2] - x[-3]
+        h1 = x[-1] - x[-2]
+        weights[-1] += (2.0*h1**2 + 3.0*h0*h1) / (6.0*(h0+h1))
+        weights[-2] += (h1**2 + 3.0*h0*h1) / (6.0*h0)
+        weights[-3] -= h1**3 / (6.0*h0*(h0+h1))
+    return weights
+
+
+@njit(cache=True)
+def _ppoly_value(x, breaks, coefficients):
+    interval = np.searchsorted(breaks, x, side='right') - 1
+    if interval < 0:
+        interval = 0
+    elif interval >= coefficients.shape[1]:
+        interval = coefficients.shape[1] - 1
+    dx = x - breaks[interval]
+    return ((coefficients[0, interval]*dx + coefficients[1, interval])*dx
+            + coefficients[2, interval])*dx + coefficients[3, interval]
+
+
+@njit(cache=True)
+def _project_wp_aniso_numba(rp, rpi, simpson_weights,
+                            breaks0, coefficients0,
+                            breaks2, coefficients2,
+                            breaks4, coefficients4,
+                            beta):
+    result = np.empty(rp.size, dtype=np.float64)
+    factor0 = 1.0 + 2.0/3.0*beta + 1.0/5.0*beta**2
+    factor2 = 4.0/3.0*beta + 4.0/7.0*beta**2
+    factor4 = 8.0/35.0*beta**2
+
+    for i in range(rp.size):
+        integral = 0.0
+        for j in range(rpi.size):
+            s = np.sqrt(rp[i]*rp[i] + rpi[j]*rpi[j])
+            mu = rpi[j] / s
+            mu2 = mu*mu
+            p2 = 0.5*(3.0*mu2 - 1.0)
+            p4 = 0.125*(35.0*mu2*mu2 - 30.0*mu2 + 3.0)
+            xi0s = factor0*_ppoly_value(s, breaks0, coefficients0)
+            xi2s = factor2*_ppoly_value(s, breaks2, coefficients2)
+            xi4s = factor4*_ppoly_value(s, breaks4, coefficients4)
+            integral += simpson_weights[j]*2.0*(xi0s + xi2s*p2 + xi4s*p4)
+        result[i] = integral
+    return result
+
+
+@njit(cache=True)
+def _project_xi_numba(rp, rpi, simpson_weights, breaks, coefficients):
+    """Finite-pimax projection with the original constant edge behavior."""
+    result = np.empty(rp.size, dtype=np.float64)
+    lower = breaks[0]
+    upper = breaks[-1]
+    for i in range(rp.size):
+        integral = 0.0
+        for j in range(rpi.size):
+            s = np.sqrt(rp[i]*rp[i] + rpi[j]*rpi[j])
+            if s < lower:
+                s = lower
+            elif s > upper:
+                s = upper
+            integral += simpson_weights[j]*_ppoly_value(
+                s, breaks, coefficients)
+        result[i] = 2.0*integral
+    return result
+
+
+def warm_up_numba_kernels():
+    """Compile/load projection kernels during module setup, not sampling."""
+    rp = np.array([1.25], dtype=np.float64)
+    rpi = np.array([0.5, 1.0, 1.5], dtype=np.float64)
+    weights = _simpson_weights(rpi)
+    breaks = np.array([1.0, 2.0], dtype=np.float64)
+    coefficients = np.zeros((4, 1), dtype=np.float64)
+    coefficients[3, 0] = 1.0
+    _project_xi_numba(rp, rpi, weights, breaks, coefficients)
+    _project_wp_aniso_numba(
+        rp, rpi, weights,
+        breaks, coefficients,
+        breaks, coefficients,
+        breaks, coefficients,
+        0.5,
+    )
 
 class minimalbias_class:
     """
     Gives the g-g lensing, dSigma, and the projected galaxy correlation function, wp.
     These observables is independent from the source redshift and only the function of lens redshift.
-    
+
     The observational corrections are applied outside this class.
         - cosmological dependence of measurements (AP-like effect), this changes pimax and R.
         - photo-z correction of dSigma via Sigma_crit factor in the estimator
@@ -116,19 +219,25 @@ class minimalbias_class:
         
     def _get_wp_pimax(self, k, pk, pimax, dlnrp):
         r, xi = self._get_xigg_n(k, pk, 0, N_extrap_low=0, N_extrap_high=0 )
-        
-        rpi = np.logspace(-3, np.log10(pimax), 300)
-        rp2d, rpi2d = np.meshgrid(r, rpi)
-        s = (rp2d**2+rpi2d**2)**0.5
-        xi2d = ius(r, xi, ext=3)(s)
 
-        
-        wp = 2*integrate.simpson(xi2d, x=rpi, axis=0)
-        
+        wp = self._project_xi_pimax(r, xi, pimax)
+
         if dlnrp>0.0:
             wp = binave_array(r, wp, dlnrp)
-        
+
         return r, wp
+
+    def _project_xi_pimax(self, r, xi, pimax):
+        """Project an existing isotropic correlation function to pimax."""
+        rpi = np.logspace(-3, np.log10(pimax), 300)
+        spline = PPoly.from_spline(ius(r, xi, ext=3)._eval_args)
+        return _project_xi_numba(
+            np.ascontiguousarray(r, dtype=np.float64),
+            rpi,
+            _simpson_weights(rpi),
+            spline.x,
+            spline.c,
+        )
         
     def _get_wp_pimaxinf(self, k, pk, dlnrp, N_extrap_low=None, N_extrap_high=None):
         if N_extrap_low is None:
@@ -224,23 +333,18 @@ def _get_wp_aniso(r, xi0, xi2, xi4, beta, rp_in, pimax):
         interpolate = False
 
     rpi = np.logspace(-3, np.log10(pimax), 300) # Ok binning for 1% accuracy.
-
-    rp2, rpi2 = np.meshgrid(rp, rpi)
-
-    s = (rp2**2+rpi2**2)**0.5
-    mu= rpi2/s
-
-    xi0s = (1+2.0/3.0*beta+1.0/5.0*beta**2)*ius(r, xi0)(s)
-    xi2s = (4.0/3.0*beta+4.0/7.0*beta**2)*ius(r, xi2)(s)
-    xi4s = 8.0/35.0*beta**2*ius(r, xi4)(s)
-
-    p0 = 1
-    p2 = eval_legendre(2, mu)
-    p4 = eval_legendre(4, mu)
-
-    xi_aniso = 2*(xi0s*p0+xi2s*p2+xi4s*p4)
-
-    wp_aniso = integrate.simpson(xi_aniso, x=rpi, axis=0)
+    spline0 = PPoly.from_spline(ius(r, xi0)._eval_args)
+    spline2 = PPoly.from_spline(ius(r, xi2)._eval_args)
+    spline4 = PPoly.from_spline(ius(r, xi4)._eval_args)
+    wp_aniso = _project_wp_aniso_numba(
+        np.ascontiguousarray(rp, dtype=np.float64),
+        rpi,
+        _simpson_weights(rpi),
+        spline0.x, spline0.c,
+        spline2.x, spline2.c,
+        spline4.x, spline4.c,
+        float(beta),
+    )
 
     if interpolate:
         wp_aniso = ius(rp, wp_aniso)(rp_in)
@@ -262,4 +366,3 @@ def log_extrap_func(x,y):
         ans[sel] = 10**ius(np.log10(x),np.log10(y))(np.log10(x_new[sel]))
         return ans
     return func
-    

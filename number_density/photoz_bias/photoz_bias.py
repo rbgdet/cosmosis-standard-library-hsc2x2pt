@@ -49,7 +49,7 @@ def execute(block, config):
         else:
             raise ValueError("Unknown photo-z mode")
         # normalize
-        nz_biased /= np.trapz(nz_biased, z)
+        nz_biased /= np.trapezoid(nz_biased, z)
         block[pz, bin_name] = nz_biased
     return 0
 

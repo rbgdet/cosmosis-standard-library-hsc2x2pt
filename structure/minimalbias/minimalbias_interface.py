@@ -21,7 +21,7 @@ The radial bins are read in this module at the time of setup, and the correction
 Code reviewed by Tianqing Zhang in Oct 2023
 """
 from cosmosis.datablock import names, option_section
-from minimalbias import minimalbias_class
+from minimalbias import minimalbias_class, warm_up_numba_kernels
 import numpy as np
 import os, sys
 dirname = os.path.split(__file__)[0]
@@ -57,6 +57,7 @@ def read_rp(filename, xi_type_2pt, theta_type = 'centers'):
         
         
 def setup(options):
+    warm_up_numba_kernels()
     
     # lens redshift: Note that dSigma and wp are independent of source redshift.
     redshifts = options.get_double_array_1d(option_section, 'redshifts')

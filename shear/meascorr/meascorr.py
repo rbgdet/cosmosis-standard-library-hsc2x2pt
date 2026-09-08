@@ -10,6 +10,7 @@ Code reviewed by Tianqing Zhang in Oct 2023
 """
 import numpy as np
 import astropy.cosmology
+from numba import njit
 from scipy.interpolate import InterpolatedUnivariateSpline as ius
 from scipy.interpolate import RegularGridInterpolator
 import time
@@ -21,6 +22,28 @@ G = const.G.to('Mpc^3/s^2kg^1').value
 M_sun = const.M_sun.to('g').value
 sigcrit_prefactor = c**2/(4.*np.pi*G)*10**3/M_sun/10**12
 del c, G, M_sun # delete to save name space
+
+
+@njit(cache=True)
+def _accumulate_dsigma_correction(zl, chi_zl, chi_zs,
+                                  sumwlssigcritinvPz, prefactor):
+    """Accumulate the weighted inverse critical surface density.
+
+    This is kept allocation-free because sumwlssigcritinvPz can be a large
+    lens-by-source-redshift matrix and likelihoods may run on many MPI ranks.
+    """
+    result = 0.0
+    for j in range(chi_zs.size):
+        source_distance = chi_zs[j]
+        if source_distance <= 0.0:
+            continue
+        for i in range(zl.size):
+            sigma_cr_inv = ((1.0 + zl[i]) * chi_zl[i]
+                            * (1.0 - chi_zl[i] / source_distance)
+                            / prefactor)
+            if sigma_cr_inv > 0.0:
+                result += sigma_cr_inv * sumwlssigcritinvPz[i, j]
+    return result
 
 class dSigma_meascorr_class:
     def __init__(self, config):
@@ -38,15 +61,20 @@ class dSigma_meascorr_class:
         https://arxiv.org/abs/2111.10966
         """
         self.config = config
+        self._reference_denominator = None
 
     def set_zs(self, zs):
-        self.zs = zs
+        self.zs = np.ascontiguousarray(zs, dtype=np.float64)
+        self._reference_denominator = None
         
     def set_zl(self, zl):
-        self.zl = zl
+        self.zl = np.ascontiguousarray(zl, dtype=np.float64)
+        self._reference_denominator = None
         
     def set_sumwlssigcritinvPz(self, sumwlssigcritinvPz):
-        self.sumwlssigcritinvPz = sumwlssigcritinvPz
+        self.sumwlssigcritinvPz = np.ascontiguousarray(
+            sumwlssigcritinvPz, dtype=np.float64)
+        self._reference_denominator = None
         
     def _get_cosmo(self, Omm, w0):
         return astropy.cosmology.FlatwCDM(100, Omm, w0=w0)
@@ -72,27 +100,34 @@ class dSigma_meascorr_class:
 
         return dSigma_corr_numerator
     
-    def _get_dSigma_corr_numerator(self, dpz, Omm, w0):
+    def _get_lens_distances(self, cosmo):
         zl = self.zl
-        #zs = self.zs - dpz # This is the definition in HSC Y1 2x2pt and HSC Y3 3x2pt analyses.
-        zs = self.zs + dpz # This is the definition of CosmoSIS
-        sumwlssigcritinvPz = self.sumwlssigcritinvPz
-        
-        cosmo = self._get_cosmo(Omm, w0)
-
         zl_rough = np.linspace(zl.min(), zl.max()+0.001,100) # Max has padding
-        chi_zl = ius(zl_rough, cosmo.comoving_distance(zl_rough).value)(zl)
-        chi_zs = cosmo.comoving_distance(zs).value
+        return ius(
+            zl_rough, cosmo.comoving_distance(zl_rough).value)(zl)
 
-        dSigma_corr_numerator = 0.0
-        for j in range(len(zs)):
-            if chi_zs[j] <= 0.0:
-                continue
-            Sigma_cr_inv_array = 1./sigcrit_prefactor * (1.+zl)*chi_zl*(1.-chi_zl/chi_zs[j])
-            Sigma_cr_inv_array[Sigma_cr_inv_array <0.0] = 0.0
-            dSigma_corr_numerator += np.sum(Sigma_cr_inv_array*sumwlssigcritinvPz[:,j])
+    def _get_source_distances(self, dpz, cosmo):
+        return cosmo.comoving_distance(self.zs + dpz).value
 
-        return dSigma_corr_numerator
+    def _get_distances(self, dpz, Omm=None, w0=None, cosmo=None):
+        if cosmo is None:
+            cosmo = self._get_cosmo(Omm, w0)
+        chi_zl = self._get_lens_distances(cosmo)
+        chi_zs = self._get_source_distances(dpz, cosmo)
+        return chi_zl, chi_zs
+
+    def _get_dSigma_corr_numerator(self, dpz, Omm=None, w0=None,
+                                   cosmo=None, chi_zl=None, chi_zs=None):
+        if chi_zl is None or chi_zs is None:
+            chi_zl, chi_zs = self._get_distances(dpz, Omm, w0, cosmo)
+
+        return _accumulate_dsigma_correction(
+            self.zl,
+            np.ascontiguousarray(chi_zl, dtype=np.float64),
+            np.ascontiguousarray(chi_zs, dtype=np.float64),
+            self.sumwlssigcritinvPz,
+            sigcrit_prefactor,
+        )
     
 #     def _get_dSigma_corr_numerator(self, dpz, Omm, w0, bin1, z, nz):
 #         zl = self.zl
@@ -116,11 +151,28 @@ class dSigma_meascorr_class:
 
 #         return dSigma_corr_numerator
     
-    def get_corr_factor(self, dpz, Omm, w0, bin1, z, nz):
+    def prepare_reference(self):
+        """Compute the fixed measurement-cosmology denominator once."""
+        denominator = self._get_dSigma_corr_numerator(
+            0.0, self.config['Omm'], self.config['w0'])
+        if not np.isfinite(denominator) or denominator == 0.0:
+            raise ValueError(
+                "The Delta-Sigma reference correction denominator must be "
+                "finite and non-zero"
+            )
+        self._reference_denominator = denominator
+        return denominator
+
+    def get_corr_factor(self, dpz, Omm, w0, bin1=None, z=None, nz=None,
+                        cosmo=None, chi_zl=None, chi_zs=None):
         # dSigma_corr = self._get_dSigma_corr_numerator(dpz, Omm, w0, bin1, z, nz)/self._get_dSigma_corr_denominator(0.0, self.config['Omm'], self.config['w0'])
         # print(dpz, Omm, w0)
         # print(0.0, self.config['Omm'], self.config['w0'])
-        dSigma_corr = self._get_dSigma_corr_numerator(dpz, Omm, w0)/self._get_dSigma_corr_numerator(0.0, self.config['Omm'], self.config['w0'])
+        if self._reference_denominator is None:
+            self.prepare_reference()
+        numerator = self._get_dSigma_corr_numerator(
+            dpz, Omm, w0, cosmo=cosmo, chi_zl=chi_zl, chi_zs=chi_zs)
+        dSigma_corr = numerator/self._reference_denominator
         
         # print(dSigma_corr)
         
@@ -154,6 +206,7 @@ class dSigma_meascorr_class:
         # replace
         self.zl = zlbin
         self.sumwlssigcritinvPz = sumwlssigcritinvPz_lensbin_ave
+        self._reference_denominator = None
         
     def stack(self, newone):
         assert np.all(self.zl == newone.zl), 'lens redshift does not match.'
